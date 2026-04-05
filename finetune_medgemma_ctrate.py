@@ -86,10 +86,11 @@ class CTRateDataset:
     def _load_metadata(self) -> Dict[str, Dict[str, str]]:
         metadata = {}
 
-        allowed_accessions = set()
-        with open('ctrate_train_1k.txt', 'r') as f:
+        # Load allowed VolumeNames from stratified sampling
+        allowed_volumes = set()
+        with open('data/ctrate_train_1k.txt', 'r') as f:
             for line in f:
-                allowed_accessions.add(line.strip().split('_')[0])
+                allowed_volumes.add(line.strip())
 
         with open(self.metadata_csv, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
@@ -98,8 +99,8 @@ class CTRateDataset:
                 if not volume_name:
                     continue
 
-                base_accession = volume_name.split('_a_')[0].replace('.nii.gz', '')
-                if base_accession not in allowed_accessions:
+                # Check if this volume is in our stratified list
+                if volume_name not in allowed_volumes:
                     continue
 
                 volume_path = self.data_dir / volume_name
