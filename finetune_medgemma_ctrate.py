@@ -1,5 +1,24 @@
 #!/usr/bin/env python3
-"""Fine-tune MedGemma on CTRate dataset using QLoRA."""
+"""Fine-tune MedGemma on CTRate dataset using QLoRA.
+cd /vol/ideadata/ac54awik/Medgemma_finetune
+
+# Copy the updated file (adjust path to your local copy)
+# The key change is line 443: exclude_modules=["vision_tower"]
+
+torchrun --nproc_per_node=2 finetune_medgemma_ctrate.py \
+    --data-dir /vol/idea_longterm/datasets/CT-RATE/dataset/train \
+    --metadata-csv /vol/idea_longterm/datasets/CT-RATE/dataset/radiology_text_reports/train_reports.csv \
+    --model-id /vol/ideadata/ac54awik/medgemma_27b_it_script/.hfcache/hub/models--google--medgemma-27b-it/snapshots/2d3e00ea38b50018bf5dd3aa1009457cd2d5a48f \
+    --offline \
+    --output-dir ./medgemma-ctrate-finetuned \
+    --num-train-epochs 3 \
+    --batch-size 1 \
+    --max-slices 25 \
+    --max-size 256
+
+
+
+"""
 
 import argparse
 import csv
@@ -20,7 +39,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "medgemma_27b_it_script"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
 from PIL import Image
@@ -43,6 +62,14 @@ DEFAULT_MODEL_ID = "google/medgemma-27b-it"
 DEFAULT_PROMPT = """You are an expert radiologist. Analyze the provided CT slices and generate a comprehensive radiology report.
 
 Provide a detailed paragraph describing your observations, followed by a concise summary."""
+
+# Vision model memory optimization - disable gradient checkpointing for vision tower
+# to save memory during forward pass
+def patch_vision_model_gradient_checkpointing(model, enable=False):
+    """Enable/disable gradient checkpointing for vision model."""
+    if hasattr(model, 'vision_tower'):
+        model.vision_tower.gradient_checkpointing = enable
+    return model
 
 
 class CTRateDataset:
@@ -92,6 +119,15 @@ class CTRateDataset:
             for line in f:
                 allowed_volumes.add(line.strip())
 
+        # Build a map of volume_name -> full_path by scanning directory
+        volume_path_map = {}
+        for nii_file in self.data_dir.rglob("*.nii.gz"):
+            volume_path_map[nii_file.name] = str(nii_file)
+        for nii_file in self.data_dir.rglob("*.nii"):
+            volume_path_map[nii_file.name] = str(nii_file)
+
+        logger.info(f"Found {len(volume_path_map)} NIfTI files in data directory")
+
         with open(self.metadata_csv, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
@@ -103,9 +139,12 @@ class CTRateDataset:
                 if volume_name not in allowed_volumes:
                     continue
 
-                volume_path = self.data_dir / volume_name
-                if not volume_path.exists():
+                # Look up the full path from our scanned map
+                if volume_name not in volume_path_map:
+                    logger.warning(f"Volume {volume_name} not found in data directory")
                     continue
+
+                volume_path = volume_path_map[volume_name]
 
                 findings = row.get('Findings_EN', '').strip()
                 impressions = row.get('Impressions_EN', '').strip()
@@ -333,6 +372,24 @@ def setup_model_and_processor(
     dtype: str = "bfloat16",
     offline: bool = False,
 ) -> Tuple[AutoModelForImageTextToText, AutoProcessor]:
+    """
+    Load model and processor.
+
+    Set use_4bit=False if loading an already-quantized model.
+    """
+    # Check for distributed mode via environment variables (set by torchrun)
+    import os
+    is_distributed = os.environ.get('WORLD_SIZE') is not None and int(os.environ.get('WORLD_SIZE', 1)) > 1
+
+    if is_distributed:
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        torch.cuda.set_device(local_rank)
+        device_map = {"": local_rank}
+        logger.info(f"Distributed training detected: rank {local_rank}/{os.environ.get('WORLD_SIZE')}")
+    else:
+        device_map = "auto"
+        logger.info("Single GPU training with device_map='auto'")
+
     if torch.cuda.is_available():
         device_capability = torch.cuda.get_device_capability()
         if device_capability[0] < 8:
@@ -353,7 +410,7 @@ def setup_model_and_processor(
 
     model_kwargs = {
         "torch_dtype": getattr(torch, dtype),
-        "device_map": "auto",
+        "device_map": device_map,
         "quantization_config": bnb_config,
         "offload_buffers": True,
         "local_files_only": offline,
@@ -374,6 +431,23 @@ def setup_model_and_processor(
     processor.tokenizer.padding_side = "right"
     model.gradient_checkpointing_enable()
 
+    # Freeze vision encoder to save memory - only train language model + LoRA
+    if hasattr(model, 'vision_tower'):
+        for param in model.vision_tower.parameters():
+            param.requires_grad = False
+        logger.info("Froze vision encoder (only training language model)")
+
+    # Wrap vision encoder forward pass with torch.no_grad() to avoid storing
+    # intermediate activations. Since vision encoder is frozen, we don't need
+    # any gradient tracking through it - this saves ~2-3 GB per forward pass.
+    if hasattr(model, 'model') and hasattr(model.model, 'get_image_features'):
+        original_get_image_features = model.model.get_image_features
+        def _get_image_features_no_grad(pixel_values, **kwargs):
+            with torch.no_grad():
+                return original_get_image_features(pixel_values, **kwargs)
+        model.model.get_image_features = _get_image_features_no_grad
+        logger.info("Wrapped vision encoder with torch.no_grad() (saves activation memory)")
+
     logger.info("Model and processor loaded successfully")
     return model, processor
 
@@ -382,21 +456,17 @@ def setup_lora_config(
     lora_alpha: int = 16,
     lora_dropout: float = 0.05,
     r: int = 16,
-    target_modules: str = "all-linear",
 ) -> LoraConfig:
     config = LoraConfig(
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
         r=r,
         bias="none",
-        target_modules=target_modules,
+        target_modules="all-linear",
+        exclude_modules=["vision_tower"],  # Don't apply LoRA to vision encoder
         task_type="CAUSAL_LM",
-        modules_to_save=[
-            "lm_head",
-            "embed_tokens",
-        ],
     )
-    logger.info(f"LoRA config: alpha={lora_alpha}, r={r}, dropout={lora_dropout}")
+    logger.info(f"LoRA config: alpha={lora_alpha}, r={r}, dropout={lora_dropout} (vision encoder excluded)")
     return config
 
 
@@ -417,6 +487,7 @@ def train(
     push_to_hub: bool = False,
     hub_model_id: Optional[str] = None,
     offline: bool = False,
+    use_4bit: bool = True,
 ):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -434,7 +505,7 @@ def train(
         max_samples=max_samples,
     )
 
-    model, processor = setup_model_and_processor(model_id, offline=offline)
+    model, processor = setup_model_and_processor(model_id, use_4bit=use_4bit, offline=offline)
     peft_config = setup_lora_config()
 
     train_dataset = CTRateHFDataset(ctrate.train_items, ctrate, processor)
@@ -570,6 +641,8 @@ def parse_args():
                         help="Disable saving merged models")
     parser.add_argument("--offline", action="store_true",
                         help="Use offline mode")
+    parser.add_argument("--no-4bit", action="store_true",
+                        help="Don't apply 4-bit quantization (use if model is already quantized)")
 
     return parser.parse_args()
 
@@ -604,6 +677,7 @@ def main():
         push_to_hub=args.push_to_hub,
         hub_model_id=args.hub_model_id,
         offline=args.offline,
+        use_4bit=not args.no_4bit,
     )
 
 
